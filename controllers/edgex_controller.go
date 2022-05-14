@@ -343,31 +343,23 @@ func (r *EdgeXReconciler) reconcileDeployment(ctx context.Context, edgex *device
 		edgex.Status.DeploymentReadyReplicas = readydeployment
 	}()
 
-NextUD:
 	for _, desireDeployment := range desiredeployments {
 		needdeployments[desireDeployment.Name] = true
 
-		ud := &unitv1alpha1.UnitedDeployment{}
-		err := r.Get(
-			ctx,
-			types.NamespacedName{
-				Namespace: edgex.Namespace,
-				Name:      desireDeployment.Name},
-			ud)
+		destUd := &unitv1alpha1.UnitedDeployment{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: edgex.Namespace, Name: desireDeployment.Name}, destUd); client.IgnoreNotFound(err) != nil {
+			return false, err
+		}
 
-		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				return false, err
+		desirespec := desireDeployment.Spec.DeepCopy()
+		if edgex.Spec.ImageRegistry != "" {
+			for i := range desirespec.Template.Spec.Containers {
+				desirespec.Template.Spec.Containers[i].Image = edgex.Spec.ImageRegistry + "/" + desirespec.Template.Spec.Containers[i].Image
 			}
-			desirespec := desireDeployment.Spec.DeepCopy()
+		}
 
-			if edgex.Spec.ImageRegistry != "" {
-				for i := range desirespec.Template.Spec.Containers {
-					desirespec.Template.Spec.Containers[i].Image = edgex.Spec.ImageRegistry + "/" + desirespec.Template.Spec.Containers[i].Image
-				}
-			}
-
-			ud = &unitv1alpha1.UnitedDeployment{
+		if destUd == nil {
+			destUd = &unitv1alpha1.UnitedDeployment{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      make(map[string]string),
 					Annotations: make(map[string]string),
@@ -383,49 +375,34 @@ NextUD:
 					},
 				},
 			}
-
-			ud.Labels[devicev1alpha1.LabelEdgeXGenerate] = LabelDeployment
-			pool := unitv1alpha1.Pool{
-				Name:     edgex.Spec.PoolName,
-				Replicas: pointer.Int32Ptr(1),
-			}
-			pool.NodeSelectorTerm.MatchExpressions = append(pool.NodeSelectorTerm.MatchExpressions,
-				corev1.NodeSelectorRequirement{
-					Key:      unitv1alpha1.LabelCurrentNodePool,
-					Operator: corev1.NodeSelectorOpIn,
-					Values:   []string{edgex.Spec.PoolName},
-				})
-			ud.Spec.Topology.Pools = append(ud.Spec.Topology.Pools, pool)
-			if err := controllerutil.SetOwnerReference(edgex, ud, r.Scheme); err != nil {
-				return false, err
-			}
-			if err := r.Create(ctx, ud); err != nil {
-				return false, err
-			}
 		} else {
-			if _, ok := ud.Status.PoolReplicas[edgex.Spec.PoolName]; ok {
-				if ud.Status.ReadyReplicas == ud.Status.Replicas {
-					readydeployment++
-				}
-				continue NextUD
-			}
+			destUd = destUd.DeepCopy()
+		}
 
-			pool := unitv1alpha1.Pool{
-				Name:     edgex.Spec.PoolName,
-				Replicas: pointer.Int32Ptr(1),
-			}
-			pool.NodeSelectorTerm.MatchExpressions = append(pool.NodeSelectorTerm.MatchExpressions,
-				corev1.NodeSelectorRequirement{
-					Key:      unitv1alpha1.LabelCurrentNodePool,
-					Operator: corev1.NodeSelectorOpIn,
-					Values:   []string{edgex.Spec.PoolName},
-				})
-			ud.Spec.Topology.Pools = append(ud.Spec.Topology.Pools, pool)
-			if err := controllerutil.SetOwnerReference(edgex, ud, r.Scheme); err != nil {
-				return false, err
-			}
-			if err := r.Update(ctx, ud); err != nil {
-				return false, err
+		destUd.Labels[devicev1alpha1.LabelEdgeXGenerate] = LabelDeployment
+
+		// only support one NodePool
+		pool := unitv1alpha1.Pool{
+			Name:     edgex.Spec.PoolName,
+			Replicas: pointer.Int32Ptr(1),
+		}
+		pool.NodeSelectorTerm.MatchExpressions = append(pool.NodeSelectorTerm.MatchExpressions,
+			corev1.NodeSelectorRequirement{
+				Key:      unitv1alpha1.LabelCurrentNodePool,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{edgex.Spec.PoolName},
+			})
+
+		destUd.Spec.Topology.Pools = append(destUd.Spec.Topology.Pools, pool)
+
+		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, destUd, func() error {
+			return controllerutil.SetOwnerReference(edgex, destUd, r.Scheme)
+		}); err != nil {
+			return false, err
+		}
+		if _, ok := destUd.Status.PoolReplicas[edgex.Spec.PoolName]; ok {
+			if destUd.Status.ReadyReplicas == destUd.Status.Replicas {
+				readydeployment++
 			}
 		}
 	}
